@@ -1,0 +1,13 @@
+services:
+  football-bot:
+    build: .
+    container_name: football-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:///./data/football_bot.sqlite
