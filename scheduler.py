@@ -1,141 +1,118 @@
-from __future__ import annotations
-
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from telegram.ext import ContextTypes
+from config import settings
+from settlement import settle
+from reports import format_report
 
-from app.services.settlement import FINISHED_STATUSES, settle_selection
-from app.utils.formatters import format_coupon_summary, format_selection_result
-
-logger = logging.getLogger(__name__)
-
-STAT_MARKETS = {
-    "corners_total",
-    "total_corners",
-    "rogi",
-    "rzuty_rozne",
-    "rzuty_rożne",
-    "corners_team",
-    "team_corners",
-    "cards_total",
-    "total_cards",
-    "kartki",
-    "cards_team",
-    "team_cards",
-}
+log = logging.getLogger("scheduler")
+PL = ZoneInfo(settings.timezone)
 
 
-def _services(context: ContextTypes.DEFAULT_TYPE):
-    return context.application.bot_data["services"]
+class SchedulerService:
+    def __init__(self, app, db, api):
+        self.app = app
+        self.db = db
+        self.api = api
 
+    def install_jobs(self):
+        jq = self.app.job_queue
+        jq.run_repeating(self.check_results, interval=180, first=20, name="wyniki")
+        jq.run_daily(self.daily_report, time=datetime.strptime("23:10", "%H:%M").time(), name="raport-dzienny")
+        jq.run_daily(self.weekly_report, time=datetime.strptime("21:00", "%H:%M").time(), days=(6,), name="raport-tygodniowy")
+        jq.run_monthly(self.monthly_report, when=datetime.strptime("20:30", "%H:%M").time(), day=1, name="raport-miesieczny")
 
-async def check_pending_results(context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = _services(context)
-    ids = await s.repo.pending_fixture_ids()
-    if not ids or not s.settings.football_api_configured:
-        return
-    try:
-        fixtures = await s.api.fixtures_batch(ids, ttl=40)
-    except Exception:
-        logger.exception("Nie udało się odświeżyć oczekujących wyników")
-        return
-
-    by_id = {int(x["fixture"]["id"]): x for x in fixtures}
-    notified_coupons: set[int] = set()
-    for fixture_id in ids:
-        fixture = by_id.get(fixture_id)
-        if not fixture:
-            continue
-        await s.repo.upsert_fixture(fixture)
-        status_short = fixture.get("fixture", {}).get("status", {}).get("short", "NS")
-        selections = await s.repo.pending_selections_for_fixture(fixture_id)
-        needs_stats = status_short in FINISHED_STATUSES and any(sel.market in STAT_MARKETS for sel in selections)
-        raw_stats = []
-        if needs_stats:
+    async def check_results(self, context):
+        rows = await self.db.pending_selections()
+        fixture_ids = sorted({int(r["fixture_id"]) for r in rows})
+        for fixture_id in fixture_ids:
             try:
-                raw_stats = await s.api.fixture_statistics(fixture_id, ttl=90)
+                fixture = await self.api.fixture(fixture_id)
+                if not fixture:
+                    continue
+                status = (((fixture.get("fixture") or {}).get("status") or {}).get("short") or "").upper()
+                if status not in {"FT","AET","PEN","PST","CANC","ABD","AWD","WO"}:
+                    continue
+                stats = await self.api.fixture_statistics(fixture_id) if status in {"FT","AET","PEN"} else []
+                selections = await self.db.fixture_selections(fixture_id)
+                for row in selections:
+                    result = settle(row, fixture, stats)
+                    if result.status == "pending":
+                        continue
+                    await self.db.settle_selection(row["id"], result.status, result.final_result, result.profit_loss)
+                    coupon, _ = await self.db.get_coupon(row["user_id"], row["coupon_id"])
+                    user = await self.db.get_notification_settings(row["user_id"])
+                    if coupon and coupon["is_placed"] and user and user["notify_selection"]:
+                        icon = {"won":"✅","lost":"❌","push":"↩️","void":"🚫"}[result.status]
+                        await context.bot.send_message(
+                            row["user_id"],
+                            f"{icon} MECZ ZAKOŃCZONY\n\n"
+                            f"{row['home_team'] or ''} – {row['away_team'] or ''}\n\n"
+                            f"Twój typ:\n{row['selection']}\n\n"
+                            f"Wynik:\n{result.final_result}\n\n"
+                            f"{icon} {result.status.upper()}\n"
+                            f"Kurs: {float(row['odds']):.2f}\n"
+                            f"Kupon: #{row['coupon_id']}"
+                        )
+                    refreshed = await self.db.refresh_coupon(row["coupon_id"])
+                    if (
+                        refreshed and refreshed["is_placed"] and refreshed["status"] != "pending"
+                        and user and user["notify_coupon"]
+                    ):
+                        # Wyślij podsumowanie tylko gdy właśnie domknęła się ostatnia selekcja.
+                        coupon2, all_picks = await self.db.get_coupon(row["user_id"], row["coupon_id"])
+                        if all(p["status"] != "pending" for p in all_picks):
+                            icon2 = {"won":"✅","lost":"❌","push":"↩️","void":"🚫"}.get(coupon2["status"], "•")
+                            lines = [
+                                f"🎟 PODSUMOWANIE KUPONU #{coupon2['coupon_id']}",
+                                "",
+                            ]
+                            for i, p in enumerate(all_picks, 1):
+                                pi = {"won":"✅","lost":"❌","push":"↩️","void":"🚫"}.get(p["status"], "•")
+                                lines.append(f"{i}. {pi} {p['selection']} @ {float(p['odds']):.2f}")
+                            lines += [
+                                "",
+                                f"Łączny kurs: {float(coupon2['combined_odds'] or 0):.2f}",
+                                f"Stawka: {float(coupon2['stake_units'] or 1):.2f} units",
+                                f"{icon2} Wynik: {coupon2['status'].upper()}",
+                                f"Profit/Loss: {float(coupon2['profit_loss'] or 0):+.2f} units",
+                            ]
+                            await context.bot.send_message(row["user_id"], "\n".join(lines))
+            except Exception as exc:
+                log.exception("Błąd sprawdzania fixture %s: %s", fixture_id, exc)
+
+    async def _send_report_to_users(self, context, since_iso, title, flag):
+        db = await self.db.connect()
+        try:
+            cur = await db.execute(f"SELECT user_id FROM users WHERE {flag}=1")
+            users = await cur.fetchall()
+        finally:
+            await db.close()
+        for u in users:
+            rows = await self.db.report_rows(u["user_id"], since_iso)
+            try:
+                await context.bot.send_message(u["user_id"], format_report(title, rows))
             except Exception:
-                logger.exception("Nie udało się pobrać statystyk fixture=%s", fixture_id)
+                pass
 
-        goals = fixture.get("goals", {})
-        score = f"{goals.get('home', '-')}:{goals.get('away', '-')}"
-        for selection in selections:
-            settlement = settle_selection(selection, fixture, raw_stats)
-            if settlement.status == "pending":
-                continue
-            settled = await s.repo.settle_selection(
-                selection.id,
-                settlement.status,
-                settlement.final_result,
-                settlement.profit_loss,
-            )
-            coupon = await s.repo.recalculate_coupon(selection.coupon_id)
-            prefs = await s.repo.get_notification_settings(selection.user_id)
-            if prefs.selection_result:
-                finished = sum(x.status != "pending" for x in coupon.selections)
-                total = len(coupon.selections)
-                text = format_selection_result(settled, score) + f"\n\nKupon: {finished}/{total} typów zakończonych."
-                try:
-                    await context.bot.send_message(selection.user_id, text)
-                except Exception:
-                    logger.exception("Nie udało się wysłać wyniku typu użytkownikowi %s", selection.user_id)
-            if coupon.status != "pending" and coupon.id not in notified_coupons and prefs.coupon_result:
-                notified_coupons.add(coupon.id)
-                try:
-                    await context.bot.send_message(selection.user_id, format_coupon_summary(coupon))
-                except Exception:
-                    logger.exception("Nie udało się wysłać podsumowania kuponu %s", coupon.id)
+    async def daily_report(self, context):
+        now = datetime.now(PL)
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(ZoneInfo("UTC")).isoformat()
+        await self._send_report_to_users(context, since, "PODSUMOWANIE DNIA", "notify_daily")
 
+    async def weekly_report(self, context):
+        since = (datetime.now(PL) - timedelta(days=7)).astimezone(ZoneInfo("UTC")).isoformat()
+        await self._send_report_to_users(context, since, "RAPORT TYGODNIOWY", "notify_weekly")
 
-async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = _services(context)
-    for user_id in await s.repo.notification_user_ids("daily_report"):
-        start, end, rows = await s.reports.daily(user_id)
-        if not rows:
-            continue
-        from app.services.reports import format_metrics_report
-
-        try:
-            await context.bot.send_message(user_id, format_metrics_report("📊 PODSUMOWANIE DNIA", start, end, rows))
-        except Exception:
-            logger.exception("Nie udało się wysłać raportu dziennego do %s", user_id)
-
-
-async def send_weekly_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = _services(context)
-    now = datetime.now(s.settings.tz)
-    if now.weekday() != 6:  # niedziela
-        return
-    from app.services.reports import format_metrics_report
-
-    for user_id in await s.repo.notification_user_ids("weekly_report"):
-        start, end, rows = await s.reports.last_days(user_id, 7)
-        if not rows:
-            continue
-        try:
-            await context.bot.send_message(user_id, format_metrics_report("📊 RAPORT TYGODNIOWY", start, end, rows))
-        except Exception:
-            logger.exception("Nie udało się wysłać raportu tygodniowego do %s", user_id)
-
-
-async def send_monthly_reports(context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = _services(context)
-    now = datetime.now(s.settings.tz)
-    if now.day != 1:
-        return
-    from app.services.reports import format_metrics_report
-
-    months = {
-        1: "STYCZNIA", 2: "LUTEGO", 3: "MARCA", 4: "KWIETNIA", 5: "MAJA", 6: "CZERWCA",
-        7: "LIPCA", 8: "SIERPNIA", 9: "WRZEŚNIA", 10: "PAŹDZIERNIKA", 11: "LISTOPADA", 12: "GRUDNIA",
-    }
-    for user_id in await s.repo.notification_user_ids("monthly_report"):
-        start, end, rows = await s.reports.month(user_id, previous=True)
-        if not rows:
-            continue
-        title = f"📅 PODSUMOWANIE {months[start.month]} {start.year}"
-        try:
-            await context.bot.send_message(user_id, format_metrics_report(title, start, end, rows))
-        except Exception:
-            logger.exception("Nie udało się wysłać raportu miesięcznego do %s", user_id)
+    async def monthly_report(self, context):
+        now = datetime.now(PL)
+        first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_prev = first_this - timedelta(seconds=1)
+        first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        await self._send_report_to_users(
+            context,
+            first_prev.astimezone(ZoneInfo("UTC")).isoformat(),
+            f"PODSUMOWANIE {last_prev.strftime('%m/%Y')}",
+            "notify_monthly"
+        )
